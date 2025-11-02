@@ -1,5 +1,8 @@
+import models
 from typing import Any, Optional
 from dataclasses import dataclass
+
+language_model = models.testing_model()
 
 def _structured_format(
     data: Any = None,
@@ -37,45 +40,77 @@ def _structured_format(
 def structured_format(data: Any) -> str:
     return _structured_format(data).strip()
 
-def generate_sync(prompt: str) -> str:
-    print(prompt)
-    return input("> ")
+def generate_field_data(path: str, fields_list: list, given: dict) -> dict:
+    fields_list = [f for f in fields_list if f.name not in given]
+    fields_list = [f for f in fields_list if f.generated]
 
-def generate_field_data(path: str, fields: dict) -> dict:
-    lines = ["Please return a list of ONLY your results, seperated by commas."]
+    lines = ["You are an adventure game engine, and you need to generate some interesting values for storytelling purposes. Avoid boring or placeholder values; get creative! Return a list of ONLY your results, split by newlines"]
+
+    if given:
+        lines.append("You are given this information to work with:")
+    for k, v in given.items():
+        lines.append(f"{k}: {v}")
+
+    lines.append("\nNow generate values for the following:")
     path = path.replace(" ", "_")
 
-    for field, field_type in fields.items():
-        lines.append(f"Please generate a value for `{path}.{field}` ({field_type.__name__})")
+    for field in fields_list:
+        if not field.generated: continue
+        line = f"{path}.{field.name}: {field.type.__name__}"
+        if field.annotation:
+            line += f" ({field.annotation})"
+        lines.append(line)
 
-    data = generate_sync("\n".join(lines))
+    prompt = "\n".join(lines) + "\n\n"
+    print(prompt)
+    data = language_model.generate_sync(prompt)
     print(data)
-    data = data.strip().split(",")
+    data = data.strip().split("\n")
 
     out = {}
-    for d, (k, field_type) in zip(data, fields.items()):
+    for raw, field in zip(data, fields_list):
+        # print("--")
+        # print(raw, field.name)
         # TODO: Raise errors and retry or someth
-        out[k] = field_type(d)
+        out[field.name] = field.type(raw)
+
+    out |= given
     return out
+
+class Field:
+    def __init__(
+            self,
+            name: str,
+            type: Any,
+            generated: bool = True,
+            public: bool = True,
+            annotation: Optional[str] = None
+        ) -> None:
+        self.name = name
+        self.type = type
+        self.generated = generated
+        self.public = public
+        self.annotation = annotation
 
 
 class Structured:
-    RELEVANT_FIELDS = {}
+    RELEVANT_FIELDS: list[Field] = []
 
     @classmethod 
-    def generate(cls, path: str = "") -> Any:
+    def generate(cls, given: Optional[dict] = None, path: str = "") -> Any:
+        given = given or {}
         out = cls()
 
         path_parts = []
         if path: path_parts.append(path)
         path_parts.append(out.get_name())
 
-        for k, v in generate_field_data(".".join(path_parts), out.RELEVANT_FIELDS).items():
+        for k, v in generate_field_data(".".join(path_parts), out.RELEVANT_FIELDS, given).items():
             setattr(out, k, v)
         return out
 
     def structured(self) -> dict:
-        return {k: getattr(self, k) for k in self.RELEVANT_FIELDS.keys()}
+        return {k.name: getattr(self, k.name, None) for k in self.RELEVANT_FIELDS}
 
     def get_name(self) -> str:
         return self.__class__.__name__
@@ -85,13 +120,44 @@ class Structured:
 
 
 class Player(Structured):
-    RELEVANT_FIELDS = {"name": str, "age": int}
+    RELEVANT_FIELDS = [Field("name", str), Field("age", int)]
     name: str = None
     age: int = None
+    
+    def __init__(self, name: str, age: int) -> None:
+        self.name = name
+        self.age = age
 
 
-player = Player.generate()
-print("--")
-print(player)
+class Location(Structured):
+    RELEVANT_FIELDS = [
+        Field("name", str),
+        Field("description", str, annotation="One sentence")
+    ]
 
-# print(structured_format({"Player": {"name": "Claire", "age": 19, "inventory": ["Sword", "Lava Crunch Cake", "Minecraft Ring"]}}))
+    name: str
+    description: str
+
+
+@dataclass
+class Game:
+    player: Player
+    location: Location
+
+    def prompt(self) -> str:
+        lines = []
+        lines.append(f"You are an adventure game engine. Take the following information and produce the next game state.\n")
+        lines.append(str(self.player))
+        lines.append(str(self.location))
+        return "\n".join(lines)
+
+location = Location.generate({"name": "Cat Village"})
+plr = Player("Claire", 19)
+
+game = Game(
+    player=plr,
+    location=location,
+)
+
+print(game.prompt())
+print(language_model.generate_sync(game.prompt()))
