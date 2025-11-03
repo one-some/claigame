@@ -1,8 +1,18 @@
+from __future__ import annotations
+
+import json
+import random
 import models
+import hashlib
 from typing import Any, Optional
 from dataclasses import dataclass
 
 language_model = models.testing_model()
+PROMPT_PREFIX = "You are a creative worldbuilding engine for a text adventure game."
+
+def hash_dict(d: dict) -> bytes:
+    # If we are not JSON serializable we're just gonna die.
+    return hashlib.sha1(json.dumps(d).encode("utf-8")).digest()
 
 def _structured_format(
     data: Any = None,
@@ -12,6 +22,9 @@ def _structured_format(
     if data is None: return ""
     if type(data) in [str, float, int]:
         return str(data)
+
+    if isinstance(data, Structured):
+        data = data.structured()
 
 
     assert type(data) in [dict, list]
@@ -40,11 +53,12 @@ def _structured_format(
 def structured_format(data: Any) -> str:
     return _structured_format(data).strip()
 
-def generate_field_data(path: str, fields_list: list, given: dict) -> dict:
+def generate_field_data(path: str, fields_list: list, given: dict, count: int = 5) -> list[dict]:
     fields_list = [f for f in fields_list if f.name not in given]
     fields_list = [f for f in fields_list if f.generated]
 
-    lines = ["You are an adventure game engine, and you need to generate some interesting values for storytelling purposes. Avoid boring or placeholder values; get creative! Return a list of ONLY your results, split by newlines"]
+    lines = [
+    ]
 
     if given:
         lines.append("You are given this information to work with:")
@@ -83,18 +97,20 @@ class Field:
             name: str,
             type: Any,
             generated: bool = True,
-            public: bool = True,
             annotation: Optional[str] = None
         ) -> None:
         self.name = name
         self.type = type
         self.generated = generated
-        self.public = public
         self.annotation = annotation
 
 
 class Structured:
     RELEVANT_FIELDS: list[Field] = []
+
+    def add_field(self, field, value) -> None:
+        self.RELEVANT_FIELDS.append(field)
+        setattr(self, field.name, value)
 
     @classmethod 
     def generate(cls, given: Optional[dict] = None, path: str = "") -> Any:
@@ -137,27 +153,67 @@ class Location(Structured):
 
     name: str
     description: str
+    world: World
+
+    def __init__(self):
+        self.actions = []
+
+    def generate_actions(self) -> None:
+        for i in range(random.randint(2, 6)):
+            self.actions.append(Action.generate(given={"location": self}))
+
+    def generate_flavor(self) -> str:
+        out = language_model.generate_sync(f"{PROMPT_PREFIX} You need to generate 1-3 sentences of flavor text and/or idle happenings in the second person from the given information. No major changes to the game state should be made by this.\n{self}\n{self.world}")
+        return out
 
 
-@dataclass
-class Game:
+class Action(Structured):
+    RELEVANT_FIELDS = [
+        Field("shortcode", str, annotation="A verb and direct object, separated by a colon. Ex: 'goto:town_tavern'. The only valid verbs are as follows: goto, get, talk, do. Use 'do' when the player's action doesn't fit into any of the others."),
+        Field("description", str, annotation="Traditional adventure game choice text. The player will only see this."),
+    ]
+
+
+    shortcode: str
+    description: str
+
+    def get_name(self):
+        return "PlayerAction"
+
+class World(Structured):
+    RELEVANT_FIELDS = [
+        Field("conditions", str, annotation="State of the world in words. Comma seperated. No more than 3. Can be very normal: 'peaceful'; can be more imaginative: 'zombie invasion'."),
+        Field("facts", str, annotation="What facts capture the world? Do not repeat conditions. Complete sentences. Comma seperated. No more than 3. Perhaps the world is identical to ours, or very different."),
+        Field("player", None, generated=False),
+    ]
+
     player: Player
-    location: Location
+    conditions: str
 
-    def prompt(self) -> str:
-        lines = []
-        lines.append(f"You are an adventure game engine. Take the following information and produce the next game state.\n")
-        lines.append(str(self.player))
-        lines.append(str(self.location))
-        return "\n".join(lines)
+    locations = {}
 
-location = Location.generate({"name": "Cat Village"})
-plr = Player("Claire", 19)
+    def get_location(self, name: str) -> Location:
+        if name in self.locations:
+            return self.locations[name]
 
-game = Game(
-    player=plr,
-    location=location,
-)
+        loc = Location.generate(given={"name": name, "world": self})
+        self.locations[name] = loc
 
-print(game.prompt())
-print(language_model.generate_sync(game.prompt()))
+        return loc
+
+player = Player("Claire", 19)
+player.add_field(Field("species", str), "humanoid robot")
+world = World.generate({"theme": "Fantasy,Outcast MC"})
+world.player = player
+
+location = world.get_location("Cat Village")
+
+print(location.description)
+print()
+print(location.generate_flavor())
+
+if not location.actions:
+    location.generate_actions()
+
+for act in location.actions:
+    print(f"({act.shortcode}) {act.description}")
