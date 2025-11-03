@@ -53,42 +53,56 @@ def _structured_format(
 def structured_format(data: Any) -> str:
     return _structured_format(data).strip()
 
-def generate_field_data(path: str, fields_list: list, given: dict, count: int = 5) -> list[dict]:
+def generate_field_data(path: str, fields_list: list, given: dict, count: int = 1) -> list[dict]:
     fields_list = [f for f in fields_list if f.name not in given]
     fields_list = [f for f in fields_list if f.generated]
 
+    # Create the prompt
+    _lore_phrase = "Generate imaginative, specific lore that avoids generic fantasy tropes."
+    if count > 1:
+        _lore_phrase = f"Generate {count} imaginative, specific lore options that avoid generic fantasy tropes."
+
     lines = [
+        f"{PROMPT_PREFIX} {_lore_phrase} Output ONLY the raw JSON object. Do not wrap it in markdown code blocks, backticks, or any other formatting.\n"
     ]
 
-    if given:
-        lines.append("You are given this information to work with:")
     for k, v in given.items():
         lines.append(f"{k}: {v}")
 
-    lines.append("\nNow generate values for the following:")
-    path = path.replace(" ", "_")
+    lines.append("\nOutput valid JSON with this structure:")
 
+    json_example = {}
     for field in fields_list:
         if not field.generated: continue
-        line = f"{path}.{field.name}: {field.type.__name__}"
-        if field.annotation:
-            line += f" ({field.annotation})"
-        lines.append(line)
+        json_example[f"{path}.{field.name}"] = f"<some {field.type.__name__} here>"
 
+    json_example = [json_example]
+
+    if count > 1:
+        json_example *= count
+
+    lines.append(json.dumps(json_example, indent=2))
+
+    lines.append("Field definitions:")
+    for field in fields_list:
+        if not field.generated: continue
+        lines.append(f"- {path}.{field.name}: {field.annotation if field.annotation else 'Self-explanatory.'}")
     prompt = "\n".join(lines) + "\n\n"
-    print(prompt)
-    data = language_model.generate_sync(prompt)
-    print(data)
-    data = data.strip().split("\n")
 
-    out = {}
-    for raw, field in zip(data, fields_list):
-        # print("--")
-        # print(raw, field.name)
-        # TODO: Raise errors and retry or someth
-        out[field.name] = field.type(raw)
+    text_out = language_model.generate_sync(prompt)
+    data = json.loads(text_out)
 
-    out |= given
+    out = []
+    for entry in data:
+        out_entry = {}
+        for (k, v), field in zip(entry.items(), fields_list):
+            # print("--")
+            # print(raw, field.name)
+            # TODO: Raise errors and retry or someth
+            out_entry[field.name] = field.type(v)
+
+        out_entry |= given
+        out.append(out_entry)
     return out
 
 class Field:
@@ -113,23 +127,31 @@ class Structured:
         setattr(self, field.name, value)
 
     @classmethod 
-    def generate(cls, given: Optional[dict] = None, path: str = "") -> Any:
+    def generate(cls, given: Optional[dict] = None) -> Any:
+        return cls.generate_many(given=given, count=1)[0]
+
+    @classmethod 
+    def generate_many(cls, given: Optional[dict] = None, count: int = 1) -> list[Any]:
         given = given or {}
-        out = cls()
 
-        path_parts = []
-        if path: path_parts.append(path)
-        path_parts.append(out.get_name())
+        out = []
+        data = generate_field_data(cls.get_name(), cls.RELEVANT_FIELDS, given, count)
 
-        for k, v in generate_field_data(".".join(path_parts), out.RELEVANT_FIELDS, given).items():
-            setattr(out, k, v)
+        for entry in data:
+            entry_object = cls()
+
+            for k, v in entry.items():
+                setattr(entry_object, k, v)
+            out.append(entry_object)
+
         return out
 
     def structured(self) -> dict:
         return {k.name: getattr(self, k.name, None) for k in self.RELEVANT_FIELDS}
 
-    def get_name(self) -> str:
-        return self.__class__.__name__
+    @classmethod
+    def get_name(cls) -> str:
+        return cls.__name__
 
     def __str__(self) -> str:
         return structured_format({self.get_name(): self.structured()})
@@ -159,8 +181,7 @@ class Location(Structured):
         self.actions = []
 
     def generate_actions(self) -> None:
-        for i in range(random.randint(2, 6)):
-            self.actions.append(Action.generate(given={"location": self}))
+        self.actions += Action.generate_many(count=random.randint(2, 6), given={"location": self})
 
     def generate_flavor(self) -> str:
         out = language_model.generate_sync(f"{PROMPT_PREFIX} You need to generate 1-3 sentences of flavor text and/or idle happenings in the second person from the given information. No major changes to the game state should be made by this.\n{self}\n{self.world}")
@@ -170,14 +191,15 @@ class Location(Structured):
 class Action(Structured):
     RELEVANT_FIELDS = [
         Field("shortcode", str, annotation="A verb and direct object, separated by a colon. Ex: 'goto:town_tavern'. The only valid verbs are as follows: goto, get, talk, do. Use 'do' when the player's action doesn't fit into any of the others."),
-        Field("description", str, annotation="Traditional adventure game choice text. The player will only see this."),
+        Field("description", str, annotation="The player will choose this to make the action. Ex: 'Walk into the town's tavern'."),
     ]
 
 
     shortcode: str
     description: str
 
-    def get_name(self):
+    @classmethod
+    def get_name(cls) -> str:
         return "PlayerAction"
 
 class World(Structured):
