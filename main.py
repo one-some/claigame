@@ -10,6 +10,9 @@ from dataclasses import dataclass
 language_model = models.testing_model()
 PROMPT_PREFIX = "You are a creative worldbuilding engine for a text adventure game."
 
+# Global..
+world: World
+
 def hash_dict(d: dict) -> bytes:
     # If we are not JSON serializable we're just gonna die.
     return hashlib.sha1(json.dumps(d).encode("utf-8")).digest()
@@ -181,7 +184,12 @@ class Location(Structured):
         self.actions = []
 
     def generate_actions(self) -> None:
-        self.actions += Action.generate_many(count=random.randint(2, 6), given={"location": self})
+        new_actions = Action.generate_many(count=random.randint(2, 6), given={"location": self})
+
+        for a in new_actions:
+            a.location = self
+        
+        self.actions += new_actions
 
     def generate_flavor(self) -> str:
         out = language_model.generate_sync(f"{PROMPT_PREFIX} You need to generate 1-3 sentences of flavor text and/or idle happenings in the second person from the given information. No major changes to the game state should be made by this.\n{self}\n{self.world}")
@@ -194,13 +202,42 @@ class Action(Structured):
         Field("description", str, annotation="The player will choose this to make the action. Ex: 'Walk into the town's tavern'."),
     ]
 
-
     shortcode: str
     description: str
+    location: Location
 
     @classmethod
     def get_name(cls) -> str:
         return "PlayerAction"
+
+    def commit(self) -> None:
+        world.state_log.append(f"player:{self.shortcode}")
+        verb, noun = self.shortcode.split(":")
+
+        match verb:
+            case "goto":
+                location = world.get_location(noun)
+                world.goto(location)
+            case "talk":
+                pass
+            case "get":
+                pass
+            case "do":
+                pass
+            case _:
+                assert False, f"Don't understand '{verb}'"
+
+        happening = Happening.generate(given={"world": world, "location": self.location, "action": self})
+        print(happening)
+
+class Happening(Structured):
+    RELEVANT_FIELDS = [
+        Field("narration", str, annotation="What narration should the player see in the scene after committing to this action? Describe in descriptive prose what's happening around the player."),
+        Field("state_updates", str, annotation="What has changed in this scene? Format in snake case, actor first, comma seperated: 'snake:bite_player,player:kill_snake,villager:thank_player'"),
+    ]
+
+    narration: str
+    state_updates: str
 
 class World(Structured):
     RELEVANT_FIELDS = [
@@ -211,8 +248,11 @@ class World(Structured):
 
     player: Player
     conditions: str
+    active_location: Location
+    state_log = []
 
     locations = {}
+
 
     def get_location(self, name: str) -> Location:
         if name in self.locations:
@@ -222,6 +262,43 @@ class World(Structured):
         self.locations[name] = loc
 
         return loc
+    
+
+    def goto(self, location: Location) -> None:
+        self.active_location = location
+        print("We AT", location)
+
+class ChoiceSet:
+    @dataclass
+    class Choice:
+        text: str
+        key: str
+        on_select: Any
+
+    def __init__(self) -> None:
+        self.choices = []
+
+    def add_choice(self, text: str, on_select: Any) -> None:
+        for char in text.lower():
+            if char not in "abcdefghijklmnopqrstuvwxyz": continue
+            if any([c.key == char for c in self.choices]): continue
+
+            self.choices.append(ChoiceSet.Choice(text, char, on_select))
+            return
+        raise RuntimeError("Couldn't add choice")
+
+    def prompt(self) -> None:
+        for choice in self.choices:
+            print(f"({choice.key}) {choice.text}")
+
+        while True:
+            try:
+                key = input("action> ")
+                choice = next(filter(lambda x: x.key == key, self.choices))
+                choice.on_select()
+                break
+            except KeyError:
+                print("Please try again. Choose the key shown near your desired action")
 
 player = Player("Claire", 19)
 player.add_field(Field("species", str), "humanoid robot")
@@ -229,13 +306,19 @@ world = World.generate({"theme": "Fantasy,Outcast MC"})
 world.player = player
 
 location = world.get_location("Cat Village")
+world.active_location = location
 
-print(location.description)
-print()
-print(location.generate_flavor())
+while True:
+    print(location.description)
+    print()
+    print(location.generate_flavor())
 
-if not location.actions:
-    location.generate_actions()
+    if not location.actions:
+        location.generate_actions()
 
-for act in location.actions:
-    print(f"({act.shortcode}) {act.description}")
+    choices = ChoiceSet()
+
+    for act in location.actions:
+        choices.add_choice(f"({act.shortcode}) {act.description}", act.commit)
+
+    choices.prompt()
